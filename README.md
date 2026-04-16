@@ -106,19 +106,25 @@ Line-delimited JSON over Unix socket:
 
 ## AOSP Integration (Vendor Module)
 
-1. Copy this directory into AOSP tree: `vendor/kylin/teeproxyd/`
-2. Add to product makefile (`device/kylin/<product>/device.mk`):
-   ```make
-   PRODUCT_PACKAGES += teeproxyd
-   ```
-3. Build ROM. `teeproxyd` → `/system/bin/` and `teeproxyd.rc` → `/system/etc/init/`.
+**See [INTEGRATION.md](INTEGRATION.md) for the full step-by-step guide.**
 
-VM artifacts (`prebuilts/vm/*`) are **not** installed by the default `Android.bp` module — they are deployed to `/data/teeproxy/vm/` at runtime. Three strategies (see `Android.bp` comments):
-- **(A) adb push** via `deploy.sh` — recommended for dev/testing
-- **(B) OTA** — pack into `/data` portion of the OTA package
-- **(C) vendor prebuilts + copy** — enable the `prebuilt_etc` modules in `Android.bp` and add `copy` directives in `teeproxyd.rc`
+Quick version:
 
-## Quick Deploy (adb)
+```bash
+git clone https://github.com/TomGoh/teeproxyd.git vendor/kylin/teeproxyd
+# Then in device/kylin/<product>/device.mk:
+PRODUCT_PACKAGES += teeproxyd_all
+# Then: m
+```
+
+`teeproxyd_all` pulls in:
+- `teeproxyd` daemon → `/system/bin/teeproxyd` + `/system/etc/init/teeproxyd.rc`
+- VM artifacts (crosvm, pvmfw, pvm-manage, kernel.bin, disk.img) → `/vendor/etc/teeproxy/vm/`
+- `secret_proxy_ca` → `/vendor/etc/teeproxy/bin/`
+
+At boot, `teeproxyd.rc` (`on post-fs-data`) copies everything from `/vendor/etc/teeproxy/` to the writable `/data/teeproxy/` tree, then init starts the daemon on `sys.boot_completed=1`.
+
+## Quick Deploy (adb, dev only)
 
 ```bash
 ./deploy.sh --device 10.218.64.6 --start     # push everything + start daemon
@@ -126,4 +132,4 @@ VM artifacts (`prebuilts/vm/*`) are **not** installed by the default `Android.bp
 ./deploy.sh --stop --device 10.218.64.6      # stop everything
 ```
 
-> **Note**: `deploy.sh` does not push `secret_proxy_ca` — that binary is built separately with the Android NDK (Bionic libc for `getaddrinfo`/DNS). Deploy it to `/data/teeproxy/bin/secret_proxy_ca` by hand or via your own build pipeline.
+Use `deploy.sh` for iterative development on a device that already has a working TEE stack. For first-time bring-up, integrate via ROM (see INTEGRATION.md).

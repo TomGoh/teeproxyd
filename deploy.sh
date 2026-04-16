@@ -86,7 +86,8 @@ echo
 
 # --- Verify prebuilts present ---
 for f in prebuilts/teeproxyd prebuilts/vm/crosvm prebuilts/vm/pvm-manage \
-         prebuilts/vm/custom_pvmfw prebuilts/vm/kernel.bin prebuilts/vm/disk.img; do
+         prebuilts/vm/custom_pvmfw prebuilts/vm/kernel.bin prebuilts/vm/disk.img \
+         prebuilts/bin/secret_proxy_ca; do
     [[ -f "$f" ]] || fail "missing prebuilt: $f"
 done
 ok "all prebuilts present"
@@ -116,8 +117,12 @@ for f in crosvm custom_pvmfw pvm-manage kernel.bin disk.img; do
     "${ADB[@]}" push "prebuilts/vm/$f" "$STAGING/" 2>&1 | tail -1
 done
 
+info "  CA binary (NDK)..."
+"${ADB[@]}" push prebuilts/bin/secret_proxy_ca "$STAGING/" 2>&1 | tail -1
+
 info "Moving to $REMOTE/..."
 "${ADB[@]}" shell "su 0 cp $STAGING/teeproxyd $REMOTE/bin/ && su 0 chmod 755 $REMOTE/bin/teeproxyd"
+"${ADB[@]}" shell "su 0 cp $STAGING/secret_proxy_ca $REMOTE/bin/ && su 0 chmod 755 $REMOTE/bin/secret_proxy_ca"
 "${ADB[@]}" shell "su 0 cp $STAGING/crosvm $STAGING/custom_pvmfw $STAGING/pvm-manage $STAGING/kernel.bin $STAGING/disk.img $REMOTE/vm/"
 "${ADB[@]}" shell "su 0 chmod 755 $REMOTE/vm/crosvm $REMOTE/vm/pvm-manage"
 "${ADB[@]}" shell "su 0 chown -R root:system $REMOTE"
@@ -165,7 +170,6 @@ fi
 
 echo
 info "Next steps:"
-info "  - Also deploy secret_proxy_ca (NDK Bionic build) to $REMOTE/bin/"
 info "  - Watch daemon log:  $0 --status"
 info "  - Start daemon:      $0 --start"
 info "  - Stop everything:   $0 --stop"

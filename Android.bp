@@ -1,16 +1,20 @@
 // teeproxyd — TEE VM + CA lifecycle daemon (Phase 1)
 //
-// Integration:
-//   1. Place this directory at vendor/kylin/teeproxyd/ (or similar) in AOSP tree
-//   2. Add to product makefile: PRODUCT_PACKAGES += teeproxyd
-//   3. (optional) Add SELinux policy teeproxyd.te if device is enforcing
+// Integration: see INTEGRATION.md for step-by-step instructions.
 //
-// Runtime dependencies (not part of this module — deployed to /data/teeproxy/
-// via adb push or OTA):
-//   - /data/teeproxy/vm/{pvm-manage, crosvm, custom_pvmfw, kernel.bin, disk.img}
-//   - /data/teeproxy/bin/secret_proxy_ca (NDK Bionic build)
+// This Android.bp ships:
+//   1. teeproxyd daemon binary + init.rc  → /system/bin/ and /system/etc/init/
+//   2. VM artifacts (crosvm, pvmfw, pvm-manage, kernel.bin, disk.img)
+//      → /vendor/etc/teeproxy/vm/
+//   3. secret_proxy_ca binary               → /vendor/etc/teeproxy/bin/
+//
+// At boot, teeproxyd.rc (on post-fs-data) copies the read-only artifacts
+// from /vendor/etc/teeproxy/ to the writable /data/teeproxy/ tree, because
+// pvm-manage needs to write instance.img and logs.
 
-// teeproxyd daemon: installed to /system/bin/teeproxyd with init.rc service.
+// =============================================================================
+// teeproxyd daemon → /system/bin/teeproxyd (+ init.rc)
+// =============================================================================
 cc_prebuilt_binary {
     name: "teeproxyd",
     srcs: ["prebuilts/teeproxyd"],
@@ -29,61 +33,78 @@ cc_prebuilt_binary {
 }
 
 // =============================================================================
-// VM / CA runtime artifacts (optional — can be deployed via adb/OTA instead)
+// VM runtime artifacts → /vendor/etc/teeproxy/vm/
+// Copied to /data/teeproxy/vm/ at boot by teeproxyd.rc (on post-fs-data)
 // =============================================================================
+prebuilt_etc {
+    name: "teeproxyd_vm_crosvm",
+    src: "prebuilts/vm/crosvm",
+    sub_dir: "teeproxy/vm",
+    vendor: true,
+    filename: "crosvm",
+}
+
+prebuilt_etc {
+    name: "teeproxyd_vm_pvmfw",
+    src: "prebuilts/vm/custom_pvmfw",
+    sub_dir: "teeproxy/vm",
+    vendor: true,
+    filename: "custom_pvmfw",
+}
+
+prebuilt_etc {
+    name: "teeproxyd_vm_pvm_manage",
+    src: "prebuilts/vm/pvm-manage",
+    sub_dir: "teeproxy/vm",
+    vendor: true,
+    filename: "pvm-manage",
+}
+
+prebuilt_etc {
+    name: "teeproxyd_vm_kernel",
+    src: "prebuilts/vm/kernel.bin",
+    sub_dir: "teeproxy/vm",
+    vendor: true,
+    filename: "kernel.bin",
+}
+
+prebuilt_etc {
+    name: "teeproxyd_vm_disk",
+    src: "prebuilts/vm/disk.img",
+    sub_dir: "teeproxy/vm",
+    vendor: true,
+    filename: "disk.img",
+}
+
+// =============================================================================
+// secret_proxy_ca (Android NDK / Bionic build) → /vendor/etc/teeproxy/bin/
+// Copied to /data/teeproxy/bin/ at boot by teeproxyd.rc
+// =============================================================================
+prebuilt_etc {
+    name: "teeproxyd_ca",
+    src: "prebuilts/bin/secret_proxy_ca",
+    sub_dir: "teeproxy/bin",
+    vendor: true,
+    filename: "secret_proxy_ca",
+}
+
+// =============================================================================
+// Convenience "all" module — add this single entry to PRODUCT_PACKAGES
+// =============================================================================
+// Usage in device.mk:
+//   PRODUCT_PACKAGES += teeproxyd_all
 //
-// The following files are runtime dependencies consumed by teeproxyd at
-// /data/teeproxy/. They are NOT directly part of the system image — teeproxyd
-// expects them at /data/teeproxy/vm/ and /data/teeproxy/bin/.
-//
-// Choose one of three deployment strategies:
-//
-//   (A) adb push (dev):  run deploy.sh in this repo
-//   (B) OTA data pkg:    pack into /data portion of OTA
-//   (C) vendor + copy:   enable the prebuilt_etc modules below to ship to
-//                        /vendor/etc/teeproxy/, then add copy rules in
-//                        teeproxyd.rc under `on post-fs-data`
-//
-// Strategy C is shown below (disabled by default). To enable, set
-// `enabled: true` and amend teeproxyd.rc.
-//
-// prebuilt_etc {
-//     name: "teeproxyd_vm_crosvm",
-//     src: "prebuilts/vm/crosvm",
-//     sub_dir: "teeproxy/vm",
-//     vendor: true,
-//     filename: "crosvm",
-//     enabled: false,
-// }
-// prebuilt_etc {
-//     name: "teeproxyd_vm_pvmfw",
-//     src: "prebuilts/vm/custom_pvmfw",
-//     sub_dir: "teeproxy/vm",
-//     vendor: true,
-//     filename: "custom_pvmfw",
-//     enabled: false,
-// }
-// prebuilt_etc {
-//     name: "teeproxyd_vm_pvm_manage",
-//     src: "prebuilts/vm/pvm-manage",
-//     sub_dir: "teeproxy/vm",
-//     vendor: true,
-//     filename: "pvm-manage",
-//     enabled: false,
-// }
-// prebuilt_etc {
-//     name: "teeproxyd_vm_kernel",
-//     src: "prebuilts/vm/kernel.bin",
-//     sub_dir: "teeproxy/vm",
-//     vendor: true,
-//     filename: "kernel.bin",
-//     enabled: false,
-// }
-// prebuilt_etc {
-//     name: "teeproxyd_vm_disk",
-//     src: "prebuilts/vm/disk.img",
-//     sub_dir: "teeproxy/vm",
-//     vendor: true,
-//     filename: "disk.img",
-//     enabled: false,
-// }
+// This is just a phony grouping via the `required` dependency chain;
+// building teeproxyd_all pulls in every artifact above.
+phony {
+    name: "teeproxyd_all",
+    required: [
+        "teeproxyd",
+        "teeproxyd_vm_crosvm",
+        "teeproxyd_vm_pvmfw",
+        "teeproxyd_vm_pvm_manage",
+        "teeproxyd_vm_kernel",
+        "teeproxyd_vm_disk",
+        "teeproxyd_ca",
+    ],
+}

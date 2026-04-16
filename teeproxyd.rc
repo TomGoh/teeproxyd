@@ -1,11 +1,44 @@
 # /system/etc/init/teeproxyd.rc
 # TEE VM + CA lifecycle daemon for OpenClaw secure key proxy.
+#
+# At post-fs-data stage:
+#   1. Create /data/teeproxy/ directory tree
+#   2. Copy read-only VM + CA artifacts from /vendor/etc/teeproxy/
+#      into the writable /data/teeproxy/ tree (pvm-manage writes
+#      instance.img at runtime, so the directory must be writable)
+#
+# At sys.boot_completed=1: start the teeproxyd service.
 
 on post-fs-data
+    # Create data directories (root:system, 0750)
     mkdir /data/teeproxy 0750 root system
     mkdir /data/teeproxy/vm 0750 root system
+    mkdir /data/teeproxy/vm/.pvm_instance 0750 root system
     mkdir /data/teeproxy/bin 0750 root system
     mkdir /data/teeproxy/logs 0770 root system
+
+    # Copy VM artifacts from /vendor to writable /data
+    copy /vendor/etc/teeproxy/vm/crosvm       /data/teeproxy/vm/crosvm
+    copy /vendor/etc/teeproxy/vm/custom_pvmfw /data/teeproxy/vm/custom_pvmfw
+    copy /vendor/etc/teeproxy/vm/pvm-manage   /data/teeproxy/vm/pvm-manage
+    copy /vendor/etc/teeproxy/vm/kernel.bin   /data/teeproxy/vm/kernel.bin
+    copy /vendor/etc/teeproxy/vm/disk.img     /data/teeproxy/vm/disk.img
+
+    # Copy CA binary
+    copy /vendor/etc/teeproxy/bin/secret_proxy_ca /data/teeproxy/bin/secret_proxy_ca
+
+    # Executables need +x (init's `copy` installs as 0644 by default)
+    chmod 0755 /data/teeproxy/vm/crosvm
+    chmod 0755 /data/teeproxy/vm/pvm-manage
+    chmod 0755 /data/teeproxy/bin/secret_proxy_ca
+
+    # Ownership
+    chown root system /data/teeproxy/vm/crosvm
+    chown root system /data/teeproxy/vm/custom_pvmfw
+    chown root system /data/teeproxy/vm/pvm-manage
+    chown root system /data/teeproxy/vm/kernel.bin
+    chown root system /data/teeproxy/vm/disk.img
+    chown root system /data/teeproxy/bin/secret_proxy_ca
 
 service teeproxyd /system/bin/teeproxyd
     class main
