@@ -1,6 +1,13 @@
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+
+/// Minimal HTTP/1.0 GET /health request. We send a real HTTP request (not a
+/// bare TCP connect + drop) so CA treats us as a well-formed client — a
+/// connect-then-close probe would flood ca.log with "bad HTTP method" every
+/// probe interval.
+const HEALTH_REQUEST: &[u8] =
+    b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: teeproxyd-health\r\nConnection: close\r\n\r\n";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HealthResult {
@@ -24,6 +31,10 @@ impl HealthMonitor {
             fail_threshold,
             consecutive_failures: 0,
             consecutive_timeouts: 0,
+            // Timeouts are treated more leniently than ConnectionRefused:
+            // a timeout often means the CA is busy handling a long LLM
+            // request, not actually dead. ~100s of consecutive timeouts
+            // (10 probes * 10s interval) before restart is intentional.
             timeout_threshold: 10,
         }
     }
@@ -31,7 +42,18 @@ impl HealthMonitor {
     pub fn probe(&mut self) -> HealthResult {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-            Ok(_) => {
+            Ok(mut stream) => {
+                // Send a real HTTP request so CA doesn't log "bad HTTP method"
+                // every probe. We don't care about the response body — a
+                // successful write+read is enough to confirm CA is serving.
+                // Errors here are non-fatal: the TCP connect already
+                // succeeded, so the CA is up; write/read failure just means
+                // it closed early (still counts as healthy).
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.write_all(HEALTH_REQUEST);
+                let mut sink = [0u8; 256];
+                let _ = stream.read(&mut sink);
                 self.consecutive_failures = 0;
                 self.consecutive_timeouts = 0;
                 HealthResult::Ok

@@ -4,9 +4,17 @@ use crate::log_collector;
 use crate::startup::StartupPhase;
 use crate::vm::VmManager;
 use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
+
+/// Per-request line cap. Any commands here are tiny JSON objects;
+/// 64 KiB protects the daemon from a client that dumps garbage without a
+/// newline and would otherwise grow our buffer without bound.
+const MAX_REQUEST_LINE_BYTES: u64 = 64 * 1024;
+/// Upper bound on lines the tail_log command will return, to prevent
+/// a single request from blowing up RAM on a huge rotated file.
+const MAX_TAIL_LINES: usize = 10_000;
 
 /// Handle one IPC client connection. Reads line-delimited JSON commands,
 /// dispatches, and writes JSON responses. The stream has a 5s read timeout
@@ -19,14 +27,20 @@ pub fn handle_client(
     config: &Config,
     started_at: Instant,
 ) {
-    let reader = BufReader::new(&stream);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) if !l.is_empty() => l,
-            Ok(_) => continue,
-            Err(_) => break, // timeout or disconnect
-        };
-        let req: serde_json::Value = match serde_json::from_str(&line) {
+    let mut reader = BufReader::new(&stream);
+    loop {
+        // Bound per-line reads so a misbehaving client can't OOM the daemon.
+        let mut line = String::new();
+        match reader.by_ref().take(MAX_REQUEST_LINE_BYTES).read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break, // timeout or I/O error
+        }
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let req: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
                 let _ = write_response(&stream, json!({"ok": false, "error": e.to_string()}));
@@ -117,7 +131,8 @@ fn handle_stop_ca(ca: &mut CaManager) -> serde_json::Value {
 
 fn handle_tail_log(req: &serde_json::Value, config: &Config) -> serde_json::Value {
     let source = req["source"].as_str().unwrap_or("daemon");
-    let lines = req["lines"].as_u64().unwrap_or(200) as usize;
+    let requested = req["lines"].as_u64().unwrap_or(200) as usize;
+    let lines = requested.min(MAX_TAIL_LINES);
     let log_path = match source {
         "vm" | "pvm" => config.log_dir.join("pvm.log"),
         "ca" => config.log_dir.join("ca.log"),

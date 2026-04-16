@@ -34,6 +34,13 @@ extern "C" fn signal_handler(sig: libc::c_int) {
         // Write different bytes so the main loop can distinguish signals:
         // 'T' = SIGTERM/SIGINT (shutdown), 'C' = SIGCHLD (child died)
         let byte: u8 = if sig == libc::SIGCHLD { b'C' } else { b'T' };
+        // SAFETY: write(2) is async-signal-safe. `fd` is a pipe write end we
+        // stored once at init and never close; a 1-byte write is atomic on
+        // pipes (PIPE_BUF >= 512). If the pipe is full we silently drop —
+        // the main loop only needs to know *that* a signal arrived, not how
+        // many, so coalescing is fine. Ignoring the return value is
+        // intentional; signal handlers cannot meaningfully recover from I/O
+        // errors.
         unsafe {
             libc::write(fd, &byte as *const u8 as *const _, 1);
         }

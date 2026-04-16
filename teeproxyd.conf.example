@@ -1,7 +1,7 @@
 {
     "image_dir": "/data/teeproxy/vm",
     "vm_cpus": 2,
-    "vm_mem_mb": 2048,
+    "vm_mem_mb": 256,
     "vsock_cid": 103,
 
     "ca_binary": "/data/teeproxy/bin/secret_proxy_ca",

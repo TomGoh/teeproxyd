@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::process;
 use nix::unistd::Pid;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -112,10 +113,20 @@ impl<'a> CaManager<'a> {
     }
 
     /// Check if CA port is accepting TCP connections.
+    /// Sends a real HTTP/1.0 GET /health so CA doesn't log "bad HTTP method";
+    /// we only care that the TCP + HTTP round-trip works, not the response body.
     pub fn is_port_ready(&self) -> bool {
-        TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], self.config.ca_port)),
-            Duration::from_secs(1),
-        ).is_ok()
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.config.ca_port));
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+            return false;
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.write_all(
+            b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: teeproxyd-probe\r\nConnection: close\r\n\r\n",
+        );
+        let mut sink = [0u8; 64];
+        let _ = stream.read(&mut sink);
+        true
     }
 }

@@ -50,7 +50,7 @@ pub struct Config {
 
 fn default_image_dir() -> PathBuf { PathBuf::from("/data/teeproxy/vm") }
 fn default_vm_cpus() -> u32 { 2 }
-fn default_vm_mem_mb() -> u32 { 2048 }
+fn default_vm_mem_mb() -> u32 { 256 }
 fn default_vsock_cid() -> u32 { 103 }
 fn default_ca_binary() -> PathBuf { PathBuf::from("/data/teeproxy/bin/secret_proxy_ca") }
 fn default_ca_port() -> u16 { 19030 }
@@ -140,7 +140,7 @@ mod tests {
     fn empty_json_gives_all_defaults() {
         let c: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(c.vm_cpus, 2);
-        assert_eq!(c.vm_mem_mb, 2048);
+        assert_eq!(c.vm_mem_mb, 256);
         assert_eq!(c.vsock_cid, 103);
         assert!(c.auto_start);
     }
