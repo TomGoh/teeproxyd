@@ -10,19 +10,16 @@
 //   - /data/teeproxy/vm/{pvm-manage, crosvm, custom_pvmfw, kernel.bin, disk.img}
 //   - /data/teeproxy/bin/secret_proxy_ca (NDK Bionic build)
 
+// teeproxyd daemon: installed to /system/bin/teeproxyd with init.rc service.
 cc_prebuilt_binary {
     name: "teeproxyd",
     srcs: ["prebuilts/teeproxyd"],
     stem: "teeproxyd",
     strip: {
-        none: true, // binary is pre-stripped by build.sh
+        none: true, // pre-stripped by build.sh
     },
-    // init.rc is installed via the init_rc property so init loads it
-    // automatically when the binary is present on the image.
     init_rc: ["teeproxyd.rc"],
-    // Install to /system/bin/teeproxyd. Change to `vendor: true` to install
-    // to /vendor/bin/teeproxyd if your partition layout requires it.
-    // vendor: true,
+    // vendor: true,  // uncomment to install to /vendor/bin/ instead
     arch: {
         arm64: {
             srcs: ["prebuilts/teeproxyd"],
@@ -30,3 +27,63 @@ cc_prebuilt_binary {
     },
     compile_multilib: "64",
 }
+
+// =============================================================================
+// VM / CA runtime artifacts (optional — can be deployed via adb/OTA instead)
+// =============================================================================
+//
+// The following files are runtime dependencies consumed by teeproxyd at
+// /data/teeproxy/. They are NOT directly part of the system image — teeproxyd
+// expects them at /data/teeproxy/vm/ and /data/teeproxy/bin/.
+//
+// Choose one of three deployment strategies:
+//
+//   (A) adb push (dev):  run deploy.sh in this repo
+//   (B) OTA data pkg:    pack into /data portion of OTA
+//   (C) vendor + copy:   enable the prebuilt_etc modules below to ship to
+//                        /vendor/etc/teeproxy/, then add copy rules in
+//                        teeproxyd.rc under `on post-fs-data`
+//
+// Strategy C is shown below (disabled by default). To enable, set
+// `enabled: true` and amend teeproxyd.rc.
+//
+// prebuilt_etc {
+//     name: "teeproxyd_vm_crosvm",
+//     src: "prebuilts/vm/crosvm",
+//     sub_dir: "teeproxy/vm",
+//     vendor: true,
+//     filename: "crosvm",
+//     enabled: false,
+// }
+// prebuilt_etc {
+//     name: "teeproxyd_vm_pvmfw",
+//     src: "prebuilts/vm/custom_pvmfw",
+//     sub_dir: "teeproxy/vm",
+//     vendor: true,
+//     filename: "custom_pvmfw",
+//     enabled: false,
+// }
+// prebuilt_etc {
+//     name: "teeproxyd_vm_pvm_manage",
+//     src: "prebuilts/vm/pvm-manage",
+//     sub_dir: "teeproxy/vm",
+//     vendor: true,
+//     filename: "pvm-manage",
+//     enabled: false,
+// }
+// prebuilt_etc {
+//     name: "teeproxyd_vm_kernel",
+//     src: "prebuilts/vm/kernel.bin",
+//     sub_dir: "teeproxy/vm",
+//     vendor: true,
+//     filename: "kernel.bin",
+//     enabled: false,
+// }
+// prebuilt_etc {
+//     name: "teeproxyd_vm_disk",
+//     src: "prebuilts/vm/disk.img",
+//     sub_dir: "teeproxy/vm",
+//     vendor: true,
+//     filename: "disk.img",
+//     enabled: false,
+// }

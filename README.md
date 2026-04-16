@@ -83,25 +83,47 @@ Line-delimited JSON over Unix socket:
 - **CA stays NDK/Bionic**: CA needs DNS (`getaddrinfo` → `dnsproxyd`), musl can't do DNS on Android
 - **Key provisioning NOT handled by teeproxyd**: openclaw provisions keys directly via CA's HTTP admin API (`POST /admin/keys/provision` with `X-Admin-Token`). This avoids key exposure in `/proc/pid/cmdline`.
 
+## Repository Layout
+
+```
+.
+├── Android.bp                   # AOSP vendor module definition
+├── teeproxyd.rc                 # init.rc service (auto-start at boot)
+├── teeproxyd.conf.example       # optional config (JSON)
+├── deploy.sh                    # adb deploy script (dev/testing)
+├── build.sh                     # build teeproxyd from source
+├── Cargo.toml, Cargo.lock       # Rust crate metadata
+├── src/                         # Rust source (8 modules)
+└── prebuilts/
+    ├── teeproxyd                # static musl aarch64 (1.4MB)
+    └── vm/                      # runtime VM artifacts (~135MB)
+        ├── crosvm               # crosvm-android hypervisor (14MB)
+        ├── custom_pvmfw         # pVM firmware (1.2MB)
+        ├── pvm-manage           # VM process manager (900KB)
+        ├── kernel.bin           # SM2-signed x-kernel (55MB)
+        └── disk.img             # TEE rootfs with secret_proxy_ta (64MB)
+```
+
 ## AOSP Integration (Vendor Module)
-
-This repo is structured as a drop-in AOSP vendor module:
-
-```
-vendor/kylin/teeproxyd/
-├── Android.bp              # cc_prebuilt_binary module
-├── teeproxyd.rc            # init.rc service definition
-├── prebuilts/teeproxyd     # static musl binary (aarch64, 1.4MB)
-└── src/                    # Rust source (for audit/rebuild)
-```
-
-Integration steps:
 
 1. Copy this directory into AOSP tree: `vendor/kylin/teeproxyd/`
 2. Add to product makefile (`device/kylin/<product>/device.mk`):
    ```make
    PRODUCT_PACKAGES += teeproxyd
    ```
-3. Build ROM. `teeproxyd` will be installed to `/system/bin/teeproxyd` and `teeproxyd.rc` to `/system/etc/init/teeproxyd.rc`.
+3. Build ROM. `teeproxyd` → `/system/bin/` and `teeproxyd.rc` → `/system/etc/init/`.
 
-Runtime dependencies (VM artifacts + CA binary) are deployed separately to `/data/teeproxy/` via `adb push` or OTA.
+VM artifacts (`prebuilts/vm/*`) are **not** installed by the default `Android.bp` module — they are deployed to `/data/teeproxy/vm/` at runtime. Three strategies (see `Android.bp` comments):
+- **(A) adb push** via `deploy.sh` — recommended for dev/testing
+- **(B) OTA** — pack into `/data` portion of the OTA package
+- **(C) vendor prebuilts + copy** — enable the `prebuilt_etc` modules in `Android.bp` and add `copy` directives in `teeproxyd.rc`
+
+## Quick Deploy (adb)
+
+```bash
+./deploy.sh --device 10.218.64.6 --start     # push everything + start daemon
+./deploy.sh --status --device 10.218.64.6    # check running state
+./deploy.sh --stop --device 10.218.64.6      # stop everything
+```
+
+> **Note**: `deploy.sh` does not push `secret_proxy_ca` — that binary is built separately with the Android NDK (Bionic libc for `getaddrinfo`/DNS). Deploy it to `/data/teeproxy/bin/secret_proxy_ca` by hand or via your own build pipeline.
