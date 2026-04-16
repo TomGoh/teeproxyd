@@ -2,6 +2,147 @@
 
 本文档说明如何把 teeproxyd 及其所有运行时依赖集成进 AOSP 镜像。
 
+---
+
+## 0. 集成后的目标形态
+
+在了解具体步骤前，先看清楚"集成完做成什么样"。
+
+### 0.1 用户视角
+
+设备出厂就自带 TEE 密钥代理能力，用户完全无感知：
+- 开机即可用，无需安装任何额外 App、无需 adb、无需手动配置
+- openclaw-termux 正常安装使用，开启「安全模式」时自动走 TEE 加密通道
+- Factory reset 后照样可用——系统镜像里预装的东西会自动恢复
+
+### 0.2 开机自启流程
+
+```
+设备上电
+  ↓
+Bootloader → Android init
+  ↓
+init 解析 /system/etc/init/teeproxyd.rc（由 Android.bp 构建时打入）
+  ↓
+on post-fs-data 阶段：
+  - 创建 /data/teeproxy/{vm,bin,logs}（root:system 0750）
+  - copy /vendor/etc/teeproxy/vm/*    → /data/teeproxy/vm/
+  - copy /vendor/etc/teeproxy/bin/*   → /data/teeproxy/bin/
+  - chmod 0755 可执行文件
+  ↓
+系统继续启动（Zygote、SystemServer…）
+  ↓
+on property:sys.boot_completed=1 触发：start teeproxyd
+  ↓
+teeproxyd 启动（由 init 管理生命周期）
+  ├─ 读取可选配置 /data/teeproxy/teeproxyd.conf
+  ├─ 打开 /dev/socket/teeproxyd（init 预创建的 Unix socket）
+  └─ 执行启动状态机：VmStarting → WaitingVsock → CaStarting → Complete
+  ↓
+spawn pvm-manage → crosvm → 加载 SM2 签名的 kernel.bin + disk.img
+  ↓
+x-kernel pVM 启动 → secret_proxy_ta + teec_cc_bridge 就绪
+  ↓
+teeproxyd 探测到 vsock 可用 → spawn secret_proxy_ca serve --port 19030
+  ↓
+CA 端口 19030 就绪 → 全链路 Ready
+  ↓
+用户打开 openclaw-termux → HTTP POST 127.0.0.1:19030/... → TEE 代理生效
+```
+
+从开机到 CA 就绪约 30-40 秒，全程无需人工干预。
+
+### 0.3 文件系统布局
+
+```
+/system/ （只读，随 ROM 出厂，dm-verity 保护）
+├── bin/teeproxyd                              # 守护进程二进制
+└── etc/init/teeproxyd.rc                      # init 服务定义
+
+/vendor/ （只读，随 ROM 出厂）
+└── etc/teeproxy/
+    ├── vm/
+    │   ├── crosvm                             # 虚拟机监控器
+    │   ├── custom_pvmfw                       # pVM 固件
+    │   ├── pvm-manage                         # VM 进程管理器
+    │   ├── kernel.bin                         # SM2 签名的 x-kernel
+    │   └── disk.img                           # TEE rootfs（含 TA）
+    └── bin/
+        └── secret_proxy_ca                    # CA 二进制（NDK Bionic）
+
+/data/ （读写，factory reset 会清空，每次开机由 init 从 /vendor 重建）
+└── teeproxy/
+    ├── vm/
+    │   ├── crosvm, custom_pvmfw, pvm-manage   # 从 /vendor copy（可执行）
+    │   ├── kernel.bin, disk.img               # 从 /vendor copy
+    │   └── .pvm_instance/instance.img         # pvm-manage 运行时生成（DICE 度量）
+    ├── bin/secret_proxy_ca                    # 从 /vendor copy
+    ├── logs/{daemon,pvm,ca}.log               # 运行日志
+    └── teeproxyd.conf                         # 可选：覆盖默认配置
+
+/dev/socket/teeproxyd                          # init 创建的 Unix socket (0660 root:system)
+```
+
+**关键特性**：
+- `/system` 和 `/vendor` 永久持久化，只能通过 OTA 更新
+- `/data/teeproxy/` 可以被 factory reset 清空，但下次开机 init 会从 `/vendor` 自动重建
+- 运行时持久化的 TEE 状态只有 `instance.img`（DICE 度量）和 TEE 密钥存储（加密在 disk.img 内部）
+
+### 0.4 进程树
+
+```
+init (pid 1)
+ └─ teeproxyd (init-managed)
+     ├─ pvm-manage
+     │   └─ crosvm
+     │       └─ [pVM: x-kernel + TEE apps（pKVM 硬件隔离）]
+     │             ├─ secret_proxy_ta
+     │             └─ teec_cc_bridge (vsock:9999)
+     └─ secret_proxy_ca (监听 127.0.0.1:19030)
+
+openclaw-termux App (untrusted_app 域)
+ └─ proot Ubuntu
+     └─ openclaw gateway
+         └─ HTTP POST → 127.0.0.1:19030 → CA → vsock → bridge → TA
+```
+
+### 0.5 运维特性
+
+**日常升级（OTA）**：
+- 通过 OTA 包替换 `/system/bin/teeproxyd` 和 `/vendor/etc/teeproxy/*`
+- 开机时 `on post-fs-data` 重新 copy 新版本到 `/data/teeproxy/`
+- 旧的 `instance.img` 因 DICE 度量不匹配会被 pvmfw 拒绝，自动失效 → 用户需重新 provision 密钥
+
+**故障恢复**：
+- teeproxyd 崩溃 → init 根据 .rc restart policy 自动重启
+- CA 崩溃 → teeproxyd HealthMonitor 探测 TCP + SIGCHLD 触发重启
+- VM 崩溃 → teeproxyd 检测到 pvm-manage 退出 → 状态机重启（指数退避，5 次上限）
+
+**诊断**：
+- 开发者 adb：`adb shell su 0 cat /data/teeproxy/logs/daemon.log`
+- 生产远程：openclaw-termux 通过 `/dev/socket/teeproxyd` 或 CA 的 admin API 拉取日志
+
+### 0.6 为什么必须 ROM 集成（不能只靠 adb）
+
+我们用 `adb push` 把 `teeproxyd.rc` 推到 `/system/etc/init/` 做过测试：
+- ✅ 文件写入成功，重启后依然存在
+- ❌ **init 不加载这个 .rc**：`init.svc.teeproxyd` 属性不存在，`setprop ctl.start teeproxyd` 失败
+
+Android 的安全设计：运行期加入 `/system/etc/init/` 的 `.rc` 文件不被 init 信任，**只有通过 AOSP 构建系统（Android.bp 的 `init_rc` 属性）打包的 .rc 才会被加载**。因此：
+
+| 维度 | adb 部署（开发用） | ROM 集成（目标形态） |
+|------|------------------|------------------|
+| init 识别服务 | ❌ 不识别 | ✅ 识别 |
+| 开机自启 | ❌ 需手动 `./deploy.sh --start` | ✅ sys.boot_completed=1 自动触发 |
+| factory reset 后 | ❌ 需重新 adb 部署 | ✅ 从 /vendor 自动重建 |
+| OTA 升级 | ❌ 不支持 | ✅ 标准 OTA 流程 |
+| SELinux enforcing | ⚠️ 依赖 permissive | ✅ 有正式 teeproxyd.te |
+| AVB 验证启动 | ❌ /system 改动破坏 AVB | ✅ AVB 重签后兼容 |
+
+**adb 方式只是开发调试期的临时手段，生产设备必须走 ROM 集成。**
+
+---
+
 ## TL;DR — 三步走
 
 ```bash
