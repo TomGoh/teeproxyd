@@ -1,0 +1,22 @@
+{
+    "image_dir": "/data/teeproxy/vm",
+    "vm_cpus": 2,
+    "vm_mem_mb": 2048,
+    "vsock_cid": 103,
+
+    "ca_binary": "/data/teeproxy/bin/secret_proxy_ca",
+    "ca_port": 19030,
+    "ca_admin_token": "CHANGE-ME-use-a-secure-random-token-at-least-32-chars",
+    "ca_log_level": "info",
+
+    "data_dir": "/data/teeproxy",
+    "log_dir": "/data/teeproxy/logs",
+    "auto_start": true,
+    "health_interval_secs": 10,
+    "health_fail_threshold": 3,
+
+    "vm_boot_timeout_secs": 60,
+    "vsock_probe_delay_secs": 15,
+    "ca_ready_timeout_secs": 15,
+    "shutdown_grace_secs": 3
+}

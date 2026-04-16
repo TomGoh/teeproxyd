@@ -1,0 +1,19 @@
+# /system/etc/init/teeproxyd.rc
+# TEE VM + CA lifecycle daemon for OpenClaw secure key proxy.
+
+on post-fs-data
+    mkdir /data/teeproxy 0750 root system
+    mkdir /data/teeproxy/vm 0750 root system
+    mkdir /data/teeproxy/bin 0750 root system
+    mkdir /data/teeproxy/logs 0770 root system
+
+service teeproxyd /system/bin/teeproxyd
+    class main
+    user root
+    group system inet
+    socket teeproxyd stream 0660 root system
+    capabilities SYS_NICE NET_RAW
+    disabled
+
+on property:sys.boot_completed=1
+    start teeproxyd

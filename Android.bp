@@ -1,0 +1,32 @@
+// teeproxyd — TEE VM + CA lifecycle daemon (Phase 1)
+//
+// Integration:
+//   1. Place this directory at vendor/kylin/teeproxyd/ (or similar) in AOSP tree
+//   2. Add to product makefile: PRODUCT_PACKAGES += teeproxyd
+//   3. (optional) Add SELinux policy teeproxyd.te if device is enforcing
+//
+// Runtime dependencies (not part of this module — deployed to /data/teeproxy/
+// via adb push or OTA):
+//   - /data/teeproxy/vm/{pvm-manage, crosvm, custom_pvmfw, kernel.bin, disk.img}
+//   - /data/teeproxy/bin/secret_proxy_ca (NDK Bionic build)
+
+cc_prebuilt_binary {
+    name: "teeproxyd",
+    srcs: ["prebuilts/teeproxyd"],
+    stem: "teeproxyd",
+    strip: {
+        none: true, // binary is pre-stripped by build.sh
+    },
+    // init.rc is installed via the init_rc property so init loads it
+    // automatically when the binary is present on the image.
+    init_rc: ["teeproxyd.rc"],
+    // Install to /system/bin/teeproxyd. Change to `vendor: true` to install
+    // to /vendor/bin/teeproxyd if your partition layout requires it.
+    // vendor: true,
+    arch: {
+        arm64: {
+            srcs: ["prebuilts/teeproxyd"],
+        },
+    },
+    compile_multilib: "64",
+}
