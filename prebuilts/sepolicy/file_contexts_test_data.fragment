@@ -1,0 +1,32 @@
+# ──────────────────────────────────────────────────────────────────────
+# file_contexts_test_data fragment for teeproxyd
+# ──────────────────────────────────────────────────────────────────────
+#
+# APPEND these lines to:
+#   system/sepolicy/contexts/file_contexts_test_data
+#
+# This file is NOT a regex-matcher; it's a list of concrete paths +
+# expected labels that the `checkfc -t` build-time test uses to verify
+# each file_contexts regex hits at least one canonical path. Note the
+# difference in syntax from file_contexts: dots here are literal, not
+# escaped.
+#
+# Pick the SAME option (A or B) you picked in file_contexts.fragment.
+
+# ─── Binary location (pick ONE — match your file_contexts.fragment choice) ─
+
+# Option A: /system/bin integration
+/system/bin/teeproxyd                       u:object_r:teeproxyd_exec:s0
+
+# Option B: APEX integration (uncomment if you used Option B above)
+#/apex/com.android.virt/bin/teeproxyd       u:object_r:teeproxyd_exec:s0
+
+
+# ─── Runtime data + sockets ─────────────────────────────────────────────
+# Two entries per regex with wildcard `(/.*)?` — one for the bare dir,
+# one for a child — to verify the wildcard works.
+
+/data/teeproxy                              u:object_r:teeproxyd_data_file:s0
+/data/teeproxy/instance.img                 u:object_r:teeproxyd_data_file:s0
+/data/teeproxy/teeproxyd.sock               u:object_r:teeproxyd_socket:s0
+/dev/socket/teeproxyd                       u:object_r:teeproxyd_socket:s0

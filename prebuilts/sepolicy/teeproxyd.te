@@ -1,0 +1,338 @@
+# system/sepolicy/private/teeproxyd.te
+# ─────────────────────────────────────────────────────────────────────
+# SEPolicy for teeproxyd — TEE VM + CA lifecycle supervisor.
+#
+# Scope:
+#   teeproxyd is the top-level supervisor. It spawns pvm-manage → crosvm
+#   and secret_proxy_ca as children. For simplicity we keep ALL children
+#   in the `teeproxyd` domain; Phase 2 can split them for nested defense-
+#   in-depth (each child in its own domain with `domain_auto_trans`).
+#
+# Companion artifacts (see bottom of this file for full `file_contexts`
+# snippet and port_contexts note):
+#   - teeproxyd.rc       — init service definition (user/group/caps)
+#   - file_contexts      — labels binaries + /data tree + sockets + /tmp
+#   - port_contexts      — labels TCP port 19030 (optional tightening)
+#
+# Deployment path (standard AOSP layout):
+#   system/sepolicy/private/teeproxyd.te        ← this file
+#   system/sepolicy/public/teeproxyd.te         ← nothing public yet
+#   system/sepolicy/private/file_contexts       ← entries at bottom
+#   system/sepolicy/private/service_contexts    ← (none needed, not a binder svc)
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Type declarations
+# ══════════════════════════════════════════════════════════════════════
+
+# The teeproxyd process domain. Also covers its children (crosvm,
+# pvm-manage, secret_proxy_ca) in Phase 1 — they inherit this domain
+# because we do NOT issue domain_auto_trans rules to split them out.
+type teeproxyd, domain;
+
+# Executable binary label — lets init(1) transition from `u:r:init:s0`
+# into `u:r:teeproxyd:s0` when it execs /system/bin/teeproxyd.
+type teeproxyd_exec, system_file_type, file_type, exec_type;
+
+# /data/teeproxy/ subtree label — covers config files, logs, key state,
+# and VM artifacts (crosvm / pvm-manage / custom_pvmfw / kernel.bin /
+# disk.img / secret_proxy_ca).
+type teeproxyd_data_file, file_type, data_file_type;
+
+# /data/teeproxy/teeproxyd.sock and /dev/socket/teeproxyd label —
+# Unix IPC socket openclaw connects to.
+#
+# NOTE: Some vendor policy trees (e.g. Phytium pd2508) don't declare the
+# `sock_file_type` attribute in their public policy. We drop it and rely
+# on `file_type` alone — this is sufficient for DAC/MAC enforcement on
+# the socket node since our allow rules reference `teeproxyd_socket` by
+# name. The only thing lost is membership in cross-domain neverallow
+# aggregators that reference `sock_file_type`, which don't apply to us.
+type teeproxyd_socket, file_type;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Init transition (the reason we no longer need `seclabel u:r:su:s0`)
+# ══════════════════════════════════════════════════════════════════════
+
+# Macro expands to:
+#   allow init teeproxyd_exec:file { getattr open read execute };
+#   allow init teeproxyd:process transition;
+#   type_transition init teeproxyd_exec:process teeproxyd;
+#   allow teeproxyd teeproxyd_exec:file { entrypoint read execute getattr };
+# This is precisely the "proper" replacement for the dev-only
+# `seclabel u:r:su:s0` workaround we had in the pre-policy .rc.
+init_daemon_domain(teeproxyd)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Linux capabilities (MAC side — must pair with .rc `capabilities` line)
+# ══════════════════════════════════════════════════════════════════════
+#
+# capabilities is a two-layer check: DAC layer drops caps to whatever
+# .rc specifies; then SELinux checks whether the current domain is
+# allowed to USE that cap. Both must pass. So this allow only
+# authorizes what .rc already granted.
+
+allow teeproxyd self:capability {
+    # Required by KVM_CREATE_VM(KVM_VM_TYPE_ARM_PROTECTED_MASK).
+    # Enforced directly in kernel arch/arm64/kvm/arm.c — SEPolicy
+    # cannot bypass this; .rc MUST also have SYS_ADMIN listed.
+    sys_admin
+
+    # crosvm's vcpu threads use SCHED_FIFO priority for latency.
+    sys_nice
+
+    # Raw socket ops for connectivity diagnostics. Optional; drop if
+    # TA never exercises raw-socket paths.
+    net_raw
+};
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /data/teeproxy/ tree — read + write own data
+# ══════════════════════════════════════════════════════════════════════
+
+allow teeproxyd teeproxyd_data_file:dir    create_dir_perms;
+allow teeproxyd teeproxyd_data_file:file   create_file_perms;
+allow teeproxyd teeproxyd_data_file:lnk_file { create_file_perms };
+
+# Without a type_transition, files created via `mkdir` from init (in
+# post-fs-data) inherit the parent dir label correctly via restorecon.
+# For files created at runtime by teeproxyd itself (e.g., daemon.log,
+# pvm.log, ca.log, instance.img), an explicit type_transition ensures
+# the right label without relying on recurrent restorecon.
+type_transition teeproxyd teeproxyd_data_file:dir  teeproxyd_data_file;
+type_transition teeproxyd teeproxyd_data_file:file teeproxyd_data_file;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Composite disk scratch dir — /data/teeproxy/composite
+# ══════════════════════════════════════════════════════════════════════
+#
+# pvm-manage used to scratch into /tmp/pvm-composite but Android's /tmp
+# is non-standard (not always present, wild DAC modes, needs tmpfs
+# type_transitions). Moved to /data/teeproxy/composite in
+# pvm-manage/src/composite.rs. init.rc pre-creates the dir; pvm-manage
+# just remove_dir_all + create_dir inside it each boot.
+#
+# No extra type declarations / allow rules are needed here: the dir
+# lives under /data/teeproxy/ so it inherits teeproxyd_data_file via
+# restorecon, and we already have full create_{dir,file}_perms on
+# teeproxyd_data_file above.
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /dev/kvm — protected VM creation
+# ══════════════════════════════════════════════════════════════════════
+
+# Access the device node. `kvm_device` is a standard AOSP type;
+# verify it exists in your tree via: grep -r "kvm_device" system/sepolicy/
+# If absent (older AOSP), declare: type kvm_device, dev_type;
+# and label /dev/kvm in file_contexts.
+allow teeproxyd kvm_device:chr_file  rw_file_perms;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# vsock — teec_cc_bridge (in the VM) talks to CA via AF_VSOCK
+# ══════════════════════════════════════════════════════════════════════
+
+# AF_VSOCK stream sockets; created by the TEEC layer inside CA.
+allow teeproxyd self:vsock_socket    create_stream_socket_perms;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TCP — CA listens on :19030, binds :: for openclaw / adb forward
+# ══════════════════════════════════════════════════════════════════════
+
+allow teeproxyd self:tcp_socket {
+    create_socket_perms_no_ioctl
+    listen
+    accept
+};
+
+# name_bind on the listening port. For tight policy, label port 19030
+# specifically (see port_contexts note at bottom); otherwise allow bind
+# on unprivileged ports via the catch-all `port_t` type.
+allow teeproxyd node:tcp_socket   node_bind;
+allow teeproxyd port:tcp_socket   name_bind;
+
+# Outbound TLS connect to upstream LLM API (api.minimaxi.com:443 etc.).
+# The `https_port` type is the AOSP-standard port label for 443 outbound.
+allow teeproxyd https_port:tcp_socket  name_connect;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Unix socket IPC — openclaw connects /data/teeproxy/teeproxyd.sock
+# ══════════════════════════════════════════════════════════════════════
+
+# Manage the sock_file on disk (create at bind, unlink at shutdown).
+allow teeproxyd teeproxyd_socket:sock_file  manage_sock_file_perms;
+
+# The stream socket itself — accept, send, receive.
+allow teeproxyd self:unix_stream_socket     create_stream_socket_perms;
+
+# Allow adb-shell debug access to the IPC socket. Restrict or remove in
+# production. If openclaw runs in its own SELinux domain (e.g.
+# untrusted_app_28), add an identical pair of rules with that domain
+# instead of or in addition to `shell`.
+allow shell teeproxyd_socket:sock_file      { read write getattr };
+allow shell teeproxyd:unix_stream_socket    connectto;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DNS via Bionic dnsproxyd (CA links NDK Bionic, not musl)
+# ══════════════════════════════════════════════════════════════════════
+#
+# On Android, getaddrinfo() goes through /dev/socket/dnsproxyd →
+# netd. The CA's DNS resolution (for api.minimaxi.com etc.) relies
+# on this path — Bionic has no /etc/resolv.conf fallback.
+
+allow teeproxyd dnsproxyd_socket:sock_file  write;
+allow teeproxyd netd:unix_stream_socket     connectto;
+# mdnsd is queried by some Bionic paths during initial resolver setup.
+allow teeproxyd mdnsd_socket:sock_file      write;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Process management — spawn pvm-manage, crosvm, secret_proxy_ca
+# ══════════════════════════════════════════════════════════════════════
+#
+# Phase 1: all children inherit teeproxyd domain. No domain_auto_trans.
+
+allow teeproxyd self:capability    { setuid setgid kill };
+allow teeproxyd self:process       { fork signal sigchld sigkill sigstop };
+
+# Children exec from /data/teeproxy/bin/ and /data/teeproxy/vm/. Since
+# those paths are labeled teeproxyd_data_file, we need exec-from-data
+# allow (Android is strict about executing from /data).
+allow teeproxyd teeproxyd_data_file:file  execute_no_trans;
+
+# SEAndroid's protect-data rule (neverallow) may block `execute` on
+# data_file types by default; `execute_no_trans` is the standard
+# exception that keeps the child in the same domain as the parent.
+# If your build's neverallow forbids even this, you need:
+#   1) label the child binaries with a distinct `*_exec` type, or
+#   2) add a domain_auto_trans → separate child domain.
+
+
+# ══════════════════════════════════════════════════════════════════════
+# pKVM / virtualization subsystem
+# ══════════════════════════════════════════════════════════════════════
+
+# crosvm memfd / hugetlbfs / anon_inode usage for VM memory.
+allow teeproxyd self:anon_inode      create_file_perms;
+allow teeproxyd self:memprotect      mmap_zero;
+
+# crosvm needs eventfd / signalfd / timerfd for async I/O scheduling.
+# These self:anon_inode already cover the fd creation.
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Logging
+# ══════════════════════════════════════════════════════════════════════
+
+# env_logger writes to stderr; init's service redirection can send to
+# /dev/kmsg or the standard logcat pipeline. Allow both.
+allow teeproxyd kmsg_device:chr_file          write;
+allow teeproxyd logd:unix_stream_socket       connectto;
+allow teeproxyd logdr_socket:sock_file        write;
+allow teeproxyd logd_socket:sock_file         write;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Optional hardening — neverallow rules (enable after stabilization)
+# ══════════════════════════════════════════════════════════════════════
+#
+# These are strong declarations. If any future policy edit violates
+# them, the SEPolicy compiler (checkpolicy) will REFUSE TO BUILD —
+# they're your guardrails against accidental privilege creep.
+#
+# Uncomment only once you're confident the positive allow list above
+# covers all legitimate accesses — otherwise they may block valid ops
+# and leave you debugging "why is this denied".
+
+# # teeproxyd must NEVER write into /proc or /sys outside of designated
+# # whitelisted paths (prevents accidental sysctl tampering).
+# neverallow teeproxyd { proc_type sysfs_type }:file no_w_file_perms;
+#
+# # teeproxyd must NEVER read other apps' private data files.
+# neverallow teeproxyd app_data_file:file no_rw_file_perms;
+#
+# # teeproxyd must NEVER touch mount points (no mount/umount).
+# neverallow teeproxyd self:capability sys_mount;
+#
+# # teeproxyd must NEVER load kernel modules.
+# neverallow teeproxyd self:capability sys_module;
+#
+# # MiniMax API key in slot 0 must never leak via proc/environ.
+# # (Enforced by CA putting key only in TEE TA storage, but belt+suspenders.)
+# neverallow teeproxyd self:capability sys_ptrace;
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Companion file_contexts entries
+# ══════════════════════════════════════════════════════════════════════
+#
+# Add these lines to system/sepolicy/private/file_contexts (or the
+# appropriate vendor/ equivalent if labeling a vendor-partition binary):
+#
+#   /system/bin/teeproxyd                          u:object_r:teeproxyd_exec:s0
+#   /data/teeproxy(/.*)?                           u:object_r:teeproxyd_data_file:s0
+#   /data/teeproxy/teeproxyd\.sock                 u:object_r:teeproxyd_socket:s0
+#   /dev/socket/teeproxyd                          u:object_r:teeproxyd_socket:s0
+#
+# After adding these, on-device:
+#   restorecon -R /data/teeproxy
+#   restorecon /system/bin/teeproxyd
+#   restorecon /dev/socket/teeproxyd
+#
+# Or reflash (file_contexts is baked into the ROM image at build time).
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Companion port_contexts entry (optional, tightens port binding)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Add to system/sepolicy/private/port_contexts to label port 19030:
+#
+#   portcon tcp 19030   u:object_r:teeproxyd_port:s0
+#
+# Then declare the type in this .te file:
+#
+#   type teeproxyd_port, port_type;
+#
+# And narrow the bind allow above to:
+#
+#   allow teeproxyd teeproxyd_port:tcp_socket name_bind;
+#
+# (replaces the broad `port:tcp_socket` catch-all)
+#
+# This prevents a compromised teeproxyd from binding other privileged
+# ports, limiting blast radius.
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Verification & debugging
+# ══════════════════════════════════════════════════════════════════════
+#
+# After deploying this policy and reflashing:
+#
+#   1. Confirm transition works:
+#      adb shell su root setprop ctl.start teeproxyd
+#      adb shell getprop init.svc.teeproxyd      # should be `running`
+#      adb shell 'ps -A -Z | grep teeproxyd'     # should show u:r:teeproxyd:s0
+#
+#   2. Watch for AVC denials during a warmup smoke test:
+#      adb shell dmesg -w | grep -i 'avc.*teeproxyd'
+#
+#   3. If denials fire, use audit2allow to suggest fixes:
+#      adb shell dmesg | grep -i 'avc.*teeproxyd' > /tmp/denials.txt
+#      audit2allow -i /tmp/denials.txt
+#      (then review suggested allow rules and add targeted ones to this file)
+#
+#   4. For dev builds, start in PERMISSIVE mode to collect ALL denials
+#      before enforcing — add `permissive teeproxyd;` before the first
+#      `allow` rule, reflash, run full test suite, then collect the
+#      full denial log and enforce after rules are refined.

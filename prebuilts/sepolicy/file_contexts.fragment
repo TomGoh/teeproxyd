@@ -1,0 +1,34 @@
+# ──────────────────────────────────────────────────────────────────────
+# file_contexts fragment for teeproxyd
+# ──────────────────────────────────────────────────────────────────────
+#
+# APPEND these lines to:
+#   system/sepolicy/private/file_contexts
+#
+# The regexes here follow AOSP file_contexts syntax:
+#   - `\.` escapes a literal dot
+#   - `(/.*)?` matches the directory AND everything inside it
+#
+# CHOOSE ONE of the two `teeproxyd_exec` entries below based on where
+# the binary is installed in your ROM. Delete the other.
+
+# ─── Binary location (pick ONE) ───────────────────────────────────────
+
+# Option A: binary installed to /system/bin (classic /system integration)
+/system/bin/teeproxyd                      u:object_r:teeproxyd_exec:s0
+
+# Option B: binary installed inside com.android.virt APEX
+# (packages/modules/virtualization/ integration — comment out Option A above
+# and uncomment the line below)
+#/apex/com\.android\.virt/bin/teeproxyd    u:object_r:teeproxyd_exec:s0
+
+
+# ─── Runtime data + sockets (unchanged regardless of binary location) ──
+
+/data/teeproxy(/.*)?                       u:object_r:teeproxyd_data_file:s0
+/data/teeproxy/teeproxyd\.sock             u:object_r:teeproxyd_socket:s0
+/dev/socket/teeproxyd                      u:object_r:teeproxyd_socket:s0
+
+# Note: /data/teeproxy/composite/ is covered by the /data/teeproxy(/.*)?
+# regex above — no separate entry needed. pvm-manage creates this dir and
+# its contents at runtime, auto-labeled via type_transition in teeproxyd.te.

@@ -1,0 +1,127 @@
+# /system/etc/init/teeproxyd.rc
+# TEE VM + CA lifecycle daemon for OpenClaw secure key proxy.
+#
+# ─── NO-SEPOLICY VARIANT — USERDEBUG ROMS ONLY ─────────────────────────
+#
+# This .rc does NOT require the companion `teeproxyd.te` SEPolicy file.
+# It works by forcing the service to run in the universally permissive
+# `su` domain via `seclabel u:r:su:s0`.
+#
+# WARNING: `u:r:su:s0` ONLY EXISTS ON USERDEBUG BUILDS. A user-build ROM
+# will parse this .rc, fail to find the su domain, and refuse to start
+# the service. For production / user builds, deploy `teeproxyd.with-
+# sepolicy.rc` instead and ship `sepolicy/teeproxyd.te` into the tree.
+#
+# ─── What you give up by skipping the .te ──────────────────────────────
+#
+#   - Least-privilege domain isolation. `su` can do anything the kernel
+#     permits; a compromised teeproxyd has broad MAC access. This is the
+#     same security stance as running the daemon from `adb shell su`.
+#   - SEPolicy-enforced type transitions for /data/teeproxy/* files.
+#     Files get labeled with the default `system_data_file` instead of
+#     `teeproxyd_data_file`. Functionally fine (su can access either),
+#     but audit trails won't cleanly attribute accesses to teeproxyd.
+#   - Coverage in `audit2allow` workflows for future tightening.
+#
+# ─── Capabilities still matter here ────────────────────────────────────
+#
+# `seclabel u:r:su:s0` replaces SEPolicy (MAC) decisions. It does NOT
+# replace Linux kernel capability (DAC) decisions. The `capabilities`
+# line below grants only what the kernel strictly requires:
+#   - SYS_ADMIN  — KVM_CREATE_VM(KVM_VM_TYPE_ARM_PROTECTED_MASK)
+#   - SYS_NICE   — crosvm's SCHED_FIFO on vcpu threads
+#   - IPC_LOCK   — mlock() for vcpu control pages under pKVM (without
+#                  this, vcpu thread init fails with ENOMEM because the
+#                  default RLIMIT_MEMLOCK is only 64KiB on Android init)
+#   - NET_RAW    — raw-socket probing (optional, used for diagnostics)
+#
+# If boot-time operations fail with EPERM/ENOMEM despite running in `su`
+# domain, the Linux capability set is the most likely cause — widen
+# the list or set `capabilities` to the empty string to inherit the
+# root process's full cap set (less hygienic but works).
+
+
+on post-fs-data
+    # ─── Writable data tree (pvm-manage writes instance.img, overlay.dtbo)
+    mkdir /data/teeproxy 0750 root system
+    mkdir /data/teeproxy/vm 0750 root system
+    mkdir /data/teeproxy/vm/.pvm_instance 0750 root system
+    mkdir /data/teeproxy/bin 0750 root system
+    mkdir /data/teeproxy/logs 0770 root system
+    # Composite disk scratch dir (replaces /tmp/pvm-composite in the
+    # updated pvm-manage; required for VM boot to succeed).
+    mkdir /data/teeproxy/composite 0770 root system
+
+    # restorecon is intentionally OMITTED here. Without teeproxyd.te
+    # deployed, there are no custom labels to apply — running restorecon
+    # would be a no-op (or worse, assign `system_data_file` which is
+    # fine for su but surprises future policy authors).
+
+    # ─── Stage VM artifacts ───────────────────────────────────────────
+    #
+    # Current model: artifacts are manually `adb push`ed to
+    # /data/teeproxy/{bin,vm}/ during dev / exhibition setup. When you
+    # transition to proper ROM integration with /vendor partitioning,
+    # uncomment the block below (and remove the manual push step).
+    #
+    # copy /vendor/etc/teeproxy/vm/crosvm            /data/teeproxy/vm/crosvm
+    # copy /vendor/etc/teeproxy/vm/custom_pvmfw      /data/teeproxy/vm/custom_pvmfw
+    # copy /vendor/etc/teeproxy/vm/pvm-manage        /data/teeproxy/vm/pvm-manage
+    # copy /vendor/etc/teeproxy/vm/kernel.bin        /data/teeproxy/vm/kernel.bin
+    # copy /vendor/etc/teeproxy/vm/disk.img          /data/teeproxy/vm/disk.img
+    # copy /vendor/etc/teeproxy/bin/secret_proxy_ca  /data/teeproxy/bin/secret_proxy_ca
+    # chmod 0755 /data/teeproxy/vm/crosvm
+    # chmod 0755 /data/teeproxy/vm/pvm-manage
+    # chmod 0755 /data/teeproxy/bin/secret_proxy_ca
+    # chown root system /data/teeproxy/vm/crosvm
+    # chown root system /data/teeproxy/vm/custom_pvmfw
+    # chown root system /data/teeproxy/vm/pvm-manage
+    # chown root system /data/teeproxy/vm/kernel.bin
+    # chown root system /data/teeproxy/vm/disk.img
+    # chown root system /data/teeproxy/bin/secret_proxy_ca
+
+
+service teeproxyd /system/bin/teeproxyd
+    class main
+    user root
+    group system inet
+
+    # Pre-created Unix socket. teeproxyd's `acquire_listener()` picks up
+    # the fd via `ANDROID_SOCKET_teeproxyd` env var, avoiding a bind race.
+    socket teeproxyd stream 0660 root system
+
+    # Kernel-level DAC capabilities (see header comment).
+    capabilities SYS_ADMIN SYS_NICE NET_RAW IPC_LOCK
+
+    # ─── THE CRITICAL LINE ────────────────────────────────────────────
+    # This is what makes the service start without teeproxyd.te deployed.
+    # Maps the service into the universally permissive `su` domain.
+    # REQUIRES userdebug build; will fail on user-build ROMs.
+    seclabel u:r:su:s0
+    # ──────────────────────────────────────────────────────────────────
+
+    # Don't auto-start with `class main`. Late-start avoids a race against
+    # netd / zygote / SystemServer which aren't fully up at `class main`
+    # trigger time. The `on property:sys.boot_completed=1` block below is
+    # what actually launches us.
+    disabled
+
+
+# ─── Late-start trigger ───────────────────────────────────────────────
+#
+# Wait until SystemServer is fully up (`sys.boot_completed=1`) before
+# starting teeproxyd. This ensures:
+#   - netd is accepting connections (for DNS via dnsproxyd)
+#   - /dev/kvm is ready (pKVM init completes during early boot)
+#   - File permissions on /data are final after post-fs-data completes
+
+on property:sys.boot_completed=1
+    start teeproxyd
+
+
+# ─── Manual operator control (userdebug) ──────────────────────────────
+#
+# From adb shell (userdebug build):
+#   setprop ctl.start teeproxyd   # start
+#   setprop ctl.stop  teeproxyd   # stop (triggers graceful shutdown)
+#   getprop init.svc.teeproxyd    # state: running | stopped | stopping
