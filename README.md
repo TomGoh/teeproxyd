@@ -43,8 +43,12 @@ See `teeproxyd.rc` for the Android init.rc service definition.
 /data/teeproxy/                        # data root (root:system 0750)
   ├── vm/                              # VM artifacts
   │   ├── pvm-manage, crosvm, custom_pvmfw, kernel.bin, disk.img
-  │   └── .pvm_instance/
+  │   └── .pvm_instance/               # runtime instance.img + overlay.dtbo (DICE)
   ├── bin/secret_proxy_ca              # CA binary (NDK Bionic)
+  ├── composite/                       # pvm-manage composite disk scratch
+  │                                    # (formerly /tmp/pvm-composite, moved to
+  │                                    # /data/teeproxy to avoid /tmp DAC issues)
+  ├── pvm.socket                       # crosvm control socket (was /tmp/pvm.socket)
   ├── logs/{pvm,ca,daemon}.log
   └── teeproxyd.conf                   # optional JSON config
 /dev/socket/teeproxyd                  # init-created Unix socket

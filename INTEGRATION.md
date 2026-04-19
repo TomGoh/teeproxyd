@@ -25,10 +25,13 @@ Bootloader → Android init
 init 解析 /system/etc/init/teeproxyd.rc（由 Android.bp 构建时打入）
   ↓
 on post-fs-data 阶段：
-  - 创建 /data/teeproxy/{vm,bin,logs}（root:system 0750）
+  - 创建 /data/teeproxy/{vm,bin,logs,composite}（root:system 0750/0770）
+    · composite/ 是 pvm-manage 的 composite disk scratch 目录
+      （原先走 /tmp/pvm-composite，因 Android /tmp 不可靠迁到此处）
   - copy /vendor/etc/teeproxy/vm/*    → /data/teeproxy/vm/
   - copy /vendor/etc/teeproxy/bin/*   → /data/teeproxy/bin/
   - chmod 0755 可执行文件
+  - （可选）restorecon -R /data/teeproxy  # 仅当部署了 teeproxyd.te 时
   ↓
 系统继续启动（Zygote、SystemServer…）
   ↓
@@ -70,14 +73,20 @@ CA 端口 19030 就绪 → 全链路 Ready
     └── bin/
         └── secret_proxy_ca                    # CA 二进制（NDK Bionic）
 
-/data/ （读写，factory reset 会清空，每次开机由 init 从 /vendor 重建）
+/data/ （读写，factory reset 会清空，开机时由 init 重建目录树；
+        /vendor 文件在 post-fs-data 阶段自动复制进来）
 └── teeproxy/
     ├── vm/
     │   ├── crosvm, custom_pvmfw, pvm-manage   # 从 /vendor copy（可执行）
     │   ├── kernel.bin, disk.img               # 从 /vendor copy
-    │   └── .pvm_instance/instance.img         # pvm-manage 运行时生成（DICE 度量）
+    │   ├── .pvm_instance/instance.img         # pvm-manage 运行时生成（DICE 度量）
+    │   └── .pvm_instance/overlay.dtbo         # 运行时生成（设备树 overlay）
     ├── bin/secret_proxy_ca                    # 从 /vendor copy
-    ├── logs/{daemon,pvm,ca}.log               # 运行日志
+    ├── composite/                             # composite disk scratch（每次 VM boot
+    │   │                                        由 pvm-manage 清空重建；0770）
+    │   └── composite-instance{,.header,.footer,.filler}
+    ├── pvm.socket                             # crosvm 控制套接字（Unix domain）
+    ├── logs/{daemon,pvm,ca}.log               # 运行日志（pvm.log 10MB 自轮转）
     └── teeproxyd.conf                         # 可选：覆盖默认配置
 
 /dev/socket/teeproxyd                          # init 创建的 Unix socket (0660 root:system)
@@ -218,53 +227,82 @@ PRODUCT_PACKAGES += teeproxyd_all
 
 如果想单独挑选某些组件安装，可以直接把它们加到 `PRODUCT_PACKAGES` 里。
 
-### 3. SELinux 策略（仅当设备是 enforcing 模式时）
+### 3. SELinux 策略
 
 开发期 permissive 可跳过此步。
 
-enforcing 模式下，在 sepolicy 目录（如 `device/kylin/<product>/sepolicy/`）下添加：
+设备是 enforcing 模式时，部署 `prebuilts/sepolicy/` 下的三个文件：
 
-**teeproxyd.te**：
+- `prebuilts/sepolicy/teeproxyd.te`                         — 完整 domain 策略
+- `prebuilts/sepolicy/file_contexts.fragment`               — 要追加的 file_contexts 条目
+- `prebuilts/sepolicy/file_contexts_test_data.fragment`     — 要追加的测试数据
+
+#### 3.1 放在哪里 ─ 关键点：**system/sepolicy/private/，不是 vendor tree**
+
+teeproxyd.te 引用了 `kvm_device`、`dnsproxyd_socket`、`netd`、`mdnsd_socket` 这些**系统私有类型**（private-system types）。按 AOSP Treble policy split 的规则，vendor 侧（`device/<vendor>/sepolicy/`、`BOARD_SEPOLICY_DIRS`）**看不见**这些类型，编译会报：
+
 ```
-type teeproxyd, domain;
-type teeproxyd_exec, exec_type, system_file_type, file_type;
-
-init_daemon_domain(teeproxyd)
-
-# Capability
-allow teeproxyd self:capability { sys_nice net_raw setgid setuid };
-
-# 访问 /data/teeproxy
-type teeproxy_data_file, file_type, data_file_type;
-allow teeproxyd teeproxy_data_file:dir { create add_name remove_name search read write open };
-allow teeproxyd teeproxy_data_file:file { create read write open unlink getattr setattr execute execute_no_trans };
-
-# 读 /vendor/etc/teeproxy
-allow teeproxyd vendor_file:dir { search read open };
-allow teeproxyd vendor_file:file { read open getattr };
-
-# 网络（CA 监听 127.0.0.1:19030）
-allow teeproxyd self:tcp_socket { create bind listen accept connect read write };
-allow teeproxyd port:tcp_socket name_bind;
-allow teeproxyd node:tcp_socket node_bind;
-
-# vsock（用于 VM 探测）
-allow teeproxyd self:vsock_socket { create connect };
-
-# Unix socket IPC
-allow teeproxyd self:unix_stream_socket { create bind listen accept read write };
-
-# KVM（crosvm + pvm-manage 需要）
-allow teeproxyd kvm_device:chr_file { read write open ioctl getattr };
-
-# 执行子进程（pvm-manage、crosvm、secret_proxy_ca）
-allow teeproxyd teeproxy_data_file:file execute_no_trans;
+ERROR 'unknown type kvm_device' at token ';'
 ```
 
-然后在 `device.mk` 中加：
-```makefile
-BOARD_SEPOLICY_DIRS += device/kylin/<product>/sepolicy
+所以必须放在 plat 侧：
+
+```bash
+# 在 AOSP 源码树下（非本仓库）：
+cp vendor/kylin/teeproxyd/prebuilts/sepolicy/teeproxyd.te \
+   system/sepolicy/private/teeproxyd.te
+
+cat vendor/kylin/teeproxyd/prebuilts/sepolicy/file_contexts.fragment \
+    >> system/sepolicy/private/file_contexts
+
+cat vendor/kylin/teeproxyd/prebuilts/sepolicy/file_contexts_test_data.fragment \
+    >> system/sepolicy/contexts/file_contexts_test_data
 ```
+
+**不要**再用 `BOARD_SEPOLICY_DIRS += device/kylin/<product>/sepolicy` 的方式加 teeproxyd.te —— 那个变量指的是 vendor policy 根。
+
+#### 3.2 Capabilities 行 — **IPC_LOCK 必须有**
+
+`teeproxyd.rc` 的 service block 里：
+
+```
+capabilities SYS_ADMIN SYS_NICE NET_RAW IPC_LOCK
+```
+
+这四个 cap 是**内核硬需求**，SEPolicy 替换不了：
+
+| Cap | 为什么需要 |
+|---|---|
+| `SYS_ADMIN` | `KVM_CREATE_VM(KVM_VM_TYPE_ARM_PROTECTED_MASK)` |
+| `SYS_NICE`  | crosvm 给 vcpu 线程设 `SCHED_FIFO` |
+| `IPC_LOCK`  | pKVM vcpu 控制页 `mlock()`。**漏这个会 ENOMEM 于 vcpu 创建阶段**——Android 默认 `RLIMIT_MEMLOCK = 64KiB`，不够；`CAP_IPC_LOCK` 让 mlock 绕过 rlimit。不在任何官方文档里明确列出，但 pd2508 bring-up 实测必需 |
+| `NET_RAW`   | 诊断用 raw socket（可选） |
+
+#### 3.3 domain 过渡 vs userdebug fallback — 两种 `.rc` 变体
+
+`prebuilts/init/` 下有两个 `.rc`，对应两种部署场景：
+
+| 变体 | 用途 | 机制 |
+|---|---|---|
+| `teeproxyd.with-sepolicy.rc` | user build 或 enforcing 生产设备 | 依赖 `init_daemon_domain(teeproxyd)` 宏做 init→teeproxyd 域转换。前提是 teeproxyd.te 已部署 |
+| `teeproxyd.no-sepolicy.rc` | userdebug 开发/展会设备 | `seclabel u:r:su:s0` 走 `su` 域（userdebug 独有、universally permissive）。不部署 teeproxyd.te 也能跑 |
+
+选一个，安装时重命名为 `teeproxyd.rc`。`prebuilts/MANIFEST.md` 有选择矩阵。
+
+#### 3.4 文件布局快速参考
+
+```
+vendor/kylin/teeproxyd/prebuilts/sepolicy/    ← 本仓库内，作为 source of truth
+├── teeproxyd.te                               → system/sepolicy/private/teeproxyd.te
+├── file_contexts.fragment                     → 追加到 system/sepolicy/private/file_contexts
+└── file_contexts_test_data.fragment           → 追加到 system/sepolicy/contexts/file_contexts_test_data
+
+vendor/kylin/teeproxyd/prebuilts/init/
+├── teeproxyd.with-sepolicy.rc                 → /system/etc/init/teeproxyd.rc (生产)
+└── teeproxyd.no-sepolicy.rc                   → /system/etc/init/teeproxyd.rc (dev)
+```
+
+详细步骤见 `prebuilts/MANIFEST.md`。
 
 ### 4. 编译并刷机
 
@@ -376,6 +414,22 @@ adb shell "su 0 sh -c 'echo \"{\\\"cmd\\\":\\\"status\\\"}\" | nc -U /dev/socket
 **SELinux denial**
 - `adb shell dmesg | grep avc` 查看被拒的操作
 - 按上面步骤 3 更新 `teeproxyd.te` 策略，重新编译
+
+**crosvm 报 `vcpu hit unknown error: Out of memory (os error 12)`**
+- 这**不是** RAM 不够，是 `mlock()` 超过 `RLIMIT_MEMLOCK=64KiB`
+- 检查 `getprop init.svc.teeproxyd=running` 时 `cat /proc/<pid>/status | grep CapEff` 位 14 (0x4000) 是否置位
+- 缺位 = `.rc` 的 `capabilities` 行没加 `IPC_LOCK`。加上后重刷或 `adb push` + reboot
+- 手动 `su root teeproxyd` 能跑而 init 起不来，99% 是这个
+
+**composite disk `/tmp/pvm-composite: Permission denied`**
+- 说明设备上跑的是**旧版 pvm-manage**（still hardcoding /tmp 路径）
+- 更新二进制到本仓库 `prebuilts/vm/pvm-manage`（使用 `/data/teeproxy/composite`）
+- SHA256 验证: `sha256sum /data/teeproxy/vm/pvm-manage` 对照 `prebuilts/CHECKSUMS.sha256`
+
+**build 期间报 `ERROR 'unknown type kvm_device'`**
+- teeproxyd.te 被错误地放在了 vendor policy 下（`device/<vendor>/sepolicy/` 或 `BOARD_SEPOLICY_DIRS`）
+- 移到 `system/sepolicy/private/teeproxyd.te` —— `kvm_device` 是系统私有类型，vendor 侧看不见
+- 同时 `file_contexts.fragment` 要加到 `system/sepolicy/private/file_contexts`，**不是** vendor 的 file_contexts
 
 ---
 
