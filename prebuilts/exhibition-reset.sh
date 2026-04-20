@@ -11,17 +11,8 @@
 #   ./exhibition-reset.sh <设备 IP> [选项]
 #
 # 选项:
-#   --minimax-key <密钥>      部署完后把 MiniMax API key provision 到 slot 0
-#   --admin-token <token>    覆盖 admin token(默认读环境变量)
-#   --slot <n>               provision 到哪个 slot(默认 0)
-#   --provider <名字>        provider 名(默认 "minimax")
-#   --skip-provision         不做 key provision(只部署二进制)
 #   --skip-verify-checksums  不做 SHA256 校验(更快,用于重复测试)
 #   -h / --help              打印这个帮助
-#
-# 环境变量:
-#   SECRET_PROXY_CA_ADMIN_TOKEN   推荐用这个传 admin token(不留 shell history)
-#   MINIMAX_API_KEY               也可以用这个传 API key
 #
 # 主机端前提:
 #   - adb 在 PATH 里,设备能 `adb connect`
@@ -33,6 +24,18 @@
 #   - /system/etc/init/teeproxyd.rc 已经装好(随 ROM 刷入)
 #   - 内核编译时打开了 pKVM(`kvm-arm.mode=protected` 加进 cmdline)
 #
+# 脚本做什么:
+#   1. 预检(adb + root + ROM 侧文件齐全)
+#   2. 停掉正在跑的服务
+#   3. 推 VM + CA 二进制到 /data/teeproxy/{vm,bin}/
+#   4. SHA256 校验
+#   5. 启服务 + 等 /health 返回 200
+#
+# 脚本不做什么:
+#   - 密钥 provision —— kit 里的 disk.img 出厂 TEE 存储是空的。API key 由
+#     openclaw-termux 首次启动的 configure 流程自己注入。这样密钥不会出现
+#     在脚本参数、shell history 或日志里。
+#
 # 退出码:
 #   0   成功
 #   1   用法错误
@@ -41,7 +44,6 @@
 #   4   推送二进制失败
 #   5   SHA256 校验不匹配
 #   6   服务起不来
-#   7   provision 失败
 #
 # 幂等: 反复跑安全,每一步动作前会先看当前状态。
 
@@ -52,27 +54,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIT_DIR="$SCRIPT_DIR"
 
 DEVICE=""
-ADMIN_TOKEN="${SECRET_PROXY_CA_ADMIN_TOKEN:-}"
-MINIMAX_KEY="${MINIMAX_API_KEY:-}"
-SLOT=0
-PROVIDER="minimax"
-SKIP_PROVISION=false
 SKIP_VERIFY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            sed -n '2,40p' "$0"; exit 0 ;;
-        --minimax-key)
-            shift; MINIMAX_KEY="$1" ;;
-        --admin-token)
-            shift; ADMIN_TOKEN="$1" ;;
-        --slot)
-            shift; SLOT="$1" ;;
-        --provider)
-            shift; PROVIDER="$1" ;;
-        --skip-provision)
-            SKIP_PROVISION=true ;;
+            sed -n '2,38p' "$0"; exit 0 ;;
         --skip-verify-checksums)
             SKIP_VERIFY=true ;;
         -*)
@@ -228,54 +215,10 @@ fi
 info "进程树:"
 ashell 'su root ps -A -o PID,PPID,USER,ARGS' 2>&1 | grep -E 'teeproxy|crosvm|pvm-manage|secret_proxy_ca' | grep -v grep || true
 
-# ─── Step 5: 密钥 provision(可选) ──────────────────────────────────────
-if $SKIP_PROVISION; then
-    warn "按 --skip-provision 跳过了 provision"
-elif [[ -z "$MINIMAX_KEY" ]]; then
-    warn "没传 --minimax-key(也没设 MINIMAX_API_KEY 环境变量)"
-    warn "手动 provision 可以这样:"
-    warn "  curl -X POST http://<设备>:19030/admin/keys/provision \\"
-    warn "       -H 'X-Admin-Token: <token>' \\"
-    warn "       -d '{\"slot\":$SLOT,\"provider\":\"$PROVIDER\",\"key\":\"<minimax-key>\"}'"
-else
-    if [[ -z "$ADMIN_TOKEN" ]]; then
-        die "admin token 没设: 用 --admin-token 或者 SECRET_PROXY_CA_ADMIN_TOKEN 环境变量" 7
-    fi
-
-    info "Provision slot $SLOT (provider=$PROVIDER, key_len=${#MINIMAX_KEY})..."
-    # 把 HTTP 请求体写进本地临时文件,push 到设备,然后 nc < file
-    # 这样做是为了避开 shell 多层 quote 的坑,顺便不让 key 出现在 `ps` 输出里
-    body_file=$(mktemp)
-    trap 'rm -f "$body_file"' EXIT
-    body=$(printf '{"slot":%s,"provider":"%s","key":"%s"}' "$SLOT" "$PROVIDER" "$MINIMAX_KEY")
-    {
-        printf 'POST /admin/keys/provision HTTP/1.0\r\n'
-        printf 'Host: 127.0.0.1\r\n'
-        printf 'X-Admin-Token: %s\r\n' "$ADMIN_TOKEN"
-        printf 'Content-Type: application/json\r\n'
-        printf 'Content-Length: %d\r\n' "${#body}"
-        printf '\r\n'
-        printf '%s' "$body"
-    } > "$body_file"
-
-    remote_req="/data/local/tmp/provision-req.http"
-    apush "$body_file" "$remote_req" >/dev/null
-    resp=$(ashell "su root sh -c 'cat $remote_req | toybox nc -w 5 127.0.0.1 19030; rm -f $remote_req'")
-
-    if echo "$resp" | grep -q '"ok":true'; then
-        ok "slot $SLOT provision 成功"
-    else
-        warn "provision 响应: $resp"
-        warn "审计日志:"
-        ashell 'su root grep "audit event=admin_provision" /data/teeproxy/logs/ca.log | tail -5' 2>&1 || true
-        die "provision 失败 —— 看上面的审计日志" 7
-    fi
-fi
-
 # ─── 最后再看一次 /health 作快照 ─────────────────────────────────────────
 echo
-info "最终 /health 快照:"
+info "最终 /health 快照(TEE 存储此时应为空 slot,等 openclaw 首次启动注入):"
 ashell 'su root sh -c "printf \"GET /health HTTP/1.0\r\n\r\n\" | toybox nc -w 2 127.0.0.1 19030"' 2>/dev/null | tail -5 || true
 
 echo
-ok "${B}$DEVICE 展会重置完成${NC}"
+ok "${B}$DEVICE 展会重置完成 —— 现在打开 openclaw-termux 做 configure 即可${NC}"
